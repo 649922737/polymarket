@@ -11,14 +11,16 @@ logger = logging.getLogger("PolyBot")
 # 你可以在这里修改阈值
 STRATEGY_CONFIG = {
     "VOL_THRESHOLD_PCT": 0.0015,   # 0.15% 波动门槛 (条件1)
-    "NET_CHANGE_PCT": 0.0011,      # 0.1% 净变化门槛 (条件1)
+    "NET_CHANGE_PCT": 0.001,      # 0.1% 净变化门槛 (条件1)
     "BREAK_THRESHOLD_PCT": 0.001,  # 0.1% 突破门槛 (条件4)
     "REVERSAL_VOL_PCT": 0.0015,     # 0.15% 反转波动 (条件2)
     "REVERSAL_NET_PCT": 0.0009,    # 0.08% 反转后幅度 (条件2)
-    "PREV_CYCLE_FLUC_PCT": 0.6,    # 60% 上个周期波动 (条件3)
+    "PREV_CYCLE_FLUC_PCT": 0.7,    # 70% 上个周期波动 (条件3)
     "PREV_CYCLE_MIN_ABS": 65.0,    # 最小绝对值 65 (条件3)
+    "PREV_CYCLE_FLUC_PCT_5": 0.8,  # 80% 上个周期波动 (条件5)
+    "PREV_CYCLE_MIN_ABS_5": 45.0,  # 最小绝对值 45 (条件5)
     "MIN_ABS_CHANGE": 80.0,        # 最小绝对涨跌幅 (USD)
-    "MAX_PROB": 0.85,              # 最大概率 85%
+    "MAX_PROB": 0.9,              # 最大概率 90%
     "MACD_THRESHOLD": -1.0         # MACD 阈值 (原来是 0)
 }
 
