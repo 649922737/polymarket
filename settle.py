@@ -3,6 +3,7 @@ import time
 import json
 import logging
 import requests
+import glob
 from web3 import Web3
 from eth_account import Account
 from eth_account.messages import encode_typed_data
@@ -175,24 +176,32 @@ def settle_positions():
     try:
         logger.info("正在检查可领取奖励...")
 
-        # 1. 读取本地交易记录
-        history_file = "trade_history.csv"
-        if not os.path.exists(history_file):
-            logger.info("无交易记录。")
+        # 1. 读取本地交易记录 (支持所有历史文件)
+        my_markets = set()
+
+        # 查找所有 trade_history_*.csv 以及 trade_history.csv (如果存在)
+        history_files = glob.glob("trade_history_*.csv")
+        if os.path.exists("trade_history.csv"):
+            history_files.append("trade_history.csv")
+
+        if not history_files:
+            logger.info("无交易记录文件。")
             return
 
-        # 获取所有交易过的 Market ID
-        my_markets = set()
-        with open(history_file, 'r') as f:
-            lines = f.readlines()
-            if len(lines) > 1:
-                for line in lines[1:]:
-                    parts = line.strip().split(',')
-                    if len(parts) >= 4:
-                        mid = parts[1]
-                        my_markets.add(mid)
+        for history_file in history_files:
+            try:
+                with open(history_file, 'r') as f:
+                    lines = f.readlines()
+                    if len(lines) > 1:
+                        for line in lines[1:]:
+                            parts = line.strip().split(',')
+                            if len(parts) >= 4:
+                                mid = parts[1]
+                                my_markets.add(mid)
+            except Exception as e:
+                logger.warning(f"读取文件 {history_file} 失败: {e}")
 
-        logger.info(f"本地记录中共有 {len(my_markets)} 个参与市场。")
+        logger.info(f"本地记录中共有 {len(my_markets)} 个参与市场 (来源: {len(history_files)} 个文件)。")
 
         # 2. 读取已赎回记录 (避免重复)
         redeemed_file = "redeemed_history.json"
@@ -278,6 +287,7 @@ def settle_positions():
 
                 # 遍历 Token IDs 寻找余额
                 found_winnings = False
+                market_success = True
 
                 for i, token_id_str in enumerate(clob_token_ids):
                     try:
@@ -323,6 +333,7 @@ def settle_positions():
                                         tx_hash = send_via_safe(w3, check_address, CONFIG["PRIVATE_KEY"], CTF_ADDRESS, redeem_data)
                                     except Exception as e:
                                         logger.error(f"Safe 交易发送失败: {e}")
+                                        market_success = False # 标记失败
                                 else:
                                     # EOA
                                     gas_estimate = temp_func.estimate_gas({'from': account.address})
@@ -339,8 +350,22 @@ def settle_positions():
 
                                 if tx_hash:
                                     logger.info(f"✅ 赎回交易已发送: {tx_hash.hex()}")
+                                    logger.info("等待交易确认...")
+                                    try:
+                                        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                                        if receipt.status == 1:
+                                            logger.info(f"交易确认成功! Block: {receipt.blockNumber}")
+                                        else:
+                                            logger.error(f"交易失败! Status: {receipt.status}")
+                                            market_success = False # 交易上链但失败
+                                    except Exception as e:
+                                        logger.error(f"等待交易确认超时/失败: {e}")
+                                        market_success = False # 确认超时
+
                                     found_winnings = True
-                                    time.sleep(5)
+                                    time.sleep(2)
+                                else:
+                                    market_success = False # 发送失败
 
                             else:
                                 logger.info(f"持有输家份额 (Index {i} != Winner {winner_index})，不赎回。")
@@ -350,12 +375,14 @@ def settle_positions():
 
                     except Exception as e:
                         logger.error(f"检查余额/赎回失败: {e}")
+                        market_success = False # 异常
 
-                # 如果我们检查了所有 Token 并处理了(赢了赎回，输了跳过)，或者根本没余额
-                # 标记为已完成
-                # 如果没余额，也标记为已完成
-                redeemed_ids.add(mid)
-                new_redeemed = True
+                # 如果成功处理（或无余额），且没有发生错误，则标记为已赎回
+                if market_success:
+                    redeemed_ids.add(mid)
+                    new_redeemed = True
+                else:
+                    logger.warning(f"市场 {mid} 处理过程中发生错误，暂不标记为已完成，稍后重试。")
 
             except Exception as e:
                 logger.error(f"检查市场 {mid} 异常: {e}")

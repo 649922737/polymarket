@@ -15,26 +15,29 @@ STRATEGY_CONFIG = {
     "BREAK_THRESHOLD_PCT": 0.001,  # 0.1% 突破门槛 (条件4)
     "REVERSAL_VOL_PCT": 0.0015,     # 0.15% 反转波动 (条件2)
     "REVERSAL_NET_PCT": 0.0009,    # 0.08% 反转后幅度 (条件2)
-    "PREV_CYCLE_FLUC_PCT": 0.7,    # 70% 上个周期波动 (条件3)
+    "PREV_CYCLE_FLUC_PCT": 0.8,    # 70% 上个周期波动 (条件3)
     "PREV_CYCLE_MIN_ABS": 65.0,    # 最小绝对值 65 (条件3)
     "PREV_CYCLE_FLUC_PCT_5": 0.8,  # 80% 上个周期波动 (条件5)
     "PREV_CYCLE_MIN_ABS_5": 45.0,  # 最小绝对值 45 (条件5)
+    "PREV_CYCLE_FLUC_PCT_15": 0.8, # 80% 上个周期波动 (15m 条件3)
+    "PREV_CYCLE_MIN_ABS_15": 95.0, # 最小绝对值 95 (15m 条件3)
     "MIN_ABS_CHANGE": 80.0,        # 最小绝对涨跌幅 (USD)
     "MAX_PROB": 0.9,              # 最大概率 90%
     "MACD_THRESHOLD": -1.0         # MACD 阈值 (原来是 0)
 }
 
 # ==================== 策略加载器 ====================
-_strategies = []
 
-def load_strategies():
+def load_strategies(subdir=None):
     """动态加载 strategies 目录下的所有条件文件"""
-    global _strategies
-    _strategies = []
+    strategies = []
 
     # 获取当前文件所在目录
     base_dir = os.path.dirname(os.path.abspath(__file__))
     strategies_dir = os.path.join(base_dir, "strategies")
+
+    if subdir:
+        strategies_dir = os.path.join(strategies_dir, subdir)
 
     # 查找所有 condition*.py 文件
     pattern = os.path.join(strategies_dir, "condition*.py")
@@ -42,28 +45,30 @@ def load_strategies():
 
     if not files:
         logger.warning(f"未在 {strategies_dir} 找到任何策略文件！")
-        return
+        return []
 
     for file_path in files:
         module_name = os.path.basename(file_path).replace(".py", "")
+        # 如果在子目录，module name 可能会冲突，应该加上 prefix?
+        # importlib.util.spec_from_file_location 可以处理
+
         try:
             spec = importlib.util.spec_from_file_location(module_name, file_path)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
 
             if hasattr(module, "check"):
-                _strategies.append({
+                strategies.append({
                     "name": module_name,
                     "module": module
                 })
-                logger.info(f"已加载策略: {module_name} (Priority: {len(_strategies)})")
+                logger.info(f"已加载策略 ({subdir or 'root'}): {module_name} (Priority: {len(strategies)})")
             else:
                 logger.warning(f"策略文件 {module_name} 缺少 check 函数，跳过。")
         except Exception as e:
             logger.error(f"加载策略 {module_name} 失败: {e}")
 
-# 初始化时加载一次
-load_strategies()
+    return strategies
 
 # ==================== 指标函数 ====================
 
@@ -130,7 +135,7 @@ def calculate_macd(data, slow=26, fast=12, signal=9):
 
 # ==================== 策略主逻辑 ====================
 
-def execute_strategy(state, trigger_callback):
+def execute_strategy(state, strategies, trigger_callback):
     """
     执行策略逻辑：
     1. 计算当前市场状态和指标
@@ -149,8 +154,11 @@ def execute_strategy(state, trigger_callback):
 
     elapsed = (now - start_t).total_seconds()
 
-    # 市场未开始或已经结束，返回
-    if elapsed < 0 or elapsed > 300:
+    # 市场未开始或已经结束，返回 (5分钟=300s, 15分钟=900s)
+    # 这里我们暂时放宽到 1000s，或者根据 state.duration 判断?
+    # 简单起见，由 find_market 控制 active_market 的生命周期，这里不做硬性 300s 限制，
+    # 除非 strategies 依赖 elapsed 范围。
+    if elapsed < 0:
         return
 
     # 计算各项指标
@@ -192,12 +200,13 @@ def execute_strategy(state, trigger_callback):
     if time.time() - state.last_log_time > 5:
         # 解包 MACD Hist
         hist = macd_val[2] if macd_val else 0
-        logger.info(f"[{int(elapsed)}s] 现价:{cur_p:.1f} | 净变:{net_change:+.1f} | 波动:{fluctuation:.1f} | 反转:{state.reversal_count} | RSI:{rsi_val:.1f} | MACD:{hist:.3f}")
+        market_type = getattr(state, "market_type", "5m")
+        logger.info(f"[{market_type}][{int(elapsed)}s] 现价:{cur_p:.1f} | 净变:{net_change:+.1f} | 波动:{fluctuation:.1f} | 反转:{state.reversal_count} | RSI:{rsi_val:.1f} | MACD:{hist:.3f}")
         state.last_log_time = time.time()
 
     # ========================== 动态执行策略 ==========================
 
-    for strategy in _strategies:
+    for strategy in strategies:
         try:
             # 调用策略模块的 check 函数
             result = strategy["module"].check(state, STRATEGY_CONFIG, indicators)

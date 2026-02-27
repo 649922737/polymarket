@@ -5,7 +5,7 @@
 逻辑:
 - 时间: 全程有效
 - 条件:
-  1. 当前周期的净值 (abs(net_change)) > 上个周期波动值 (High-Low) 的 60% (可配置 PREV_CYCLE_FLUC_PCT)
+  1. 当前周期的净值 (abs(net_change)) > 上个周期波动值 (High-Low) 的 80% (可配置 PREV_CYCLE_FLUC_PCT)
   2. 当前周期的净值 (abs(net_change)) > 65 (可配置 PREV_CYCLE_MIN_ABS)
 - 动作: 直接下单
 """
