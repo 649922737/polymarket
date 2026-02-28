@@ -170,10 +170,30 @@ def check(state, config, indicators):
     if current_abs_change > ratio_threshold and current_abs_change > abs_limit:
         side = "YES" if net_change > 0 else "NO"
         reason_str = f"Condition_1_15M_FLUC ({current_abs_change:.2f} > {ratio_pct}*Max({prev_fluc:.2f}) & > {abs_limit})"
-        return {
-            "action": "trade",
-            "side": side,
-            "reason": reason_str
-        }
+
+        # RSI/MACD 过滤
+        rsi = indicators['rsi']
+        macd_tuple = indicators.get('macd', (0,0,0))
+        hist = macd_tuple[2]
+        macd_thresh = config.get("MACD_THRESHOLD", -1.0)
+
+        is_valid = False
+        if side == "YES":
+            # RSI < 85 防止追高超买, MACD > thresh 确认趋势
+            if rsi < 85 and hist > macd_thresh:
+                is_valid = True
+        else:
+            # RSI > 15 防止追低超卖, MACD < -thresh 确认趋势
+            if rsi > 15 and hist < -macd_thresh:
+                is_valid = True
+
+        if is_valid:
+            return {
+                "action": "trade",
+                "side": side,
+                "reason": reason_str
+            }
+        else:
+            logger.info(f"Condition1 (15m): 信号被过滤 | Side:{side} | RSI:{rsi:.1f} | MACD:{hist:.3f}")
 
     return None

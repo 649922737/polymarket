@@ -206,13 +206,15 @@ def execute_strategy(state, strategies, trigger_callback):
 
     # ========================== 动态执行策略 ==========================
 
+    market_type = getattr(state, "market_type", "5m")
+
     for strategy in strategies:
         try:
             # 调用策略模块的 check 函数
             result = strategy["module"].check(state, STRATEGY_CONFIG, indicators)
 
             if result and result.get("action") == "trade":
-                logger.info(f"★ 策略 [{strategy['name']}] 触发信号！原因: {result['reason']}")
+                logger.info(f"[{market_type}] ★ 策略 [{strategy['name']}] 触发信号！原因: {result['reason']}")
 
                 trigger_callback(
                     result["side"],
@@ -225,4 +227,4 @@ def execute_strategy(state, strategies, trigger_callback):
                 return # 立即退出，不再检查后续低优先级策略
 
         except Exception as e:
-            logger.error(f"策略 {strategy['name']} 执行出错: {e}")
+            logger.error(f"[{market_type}] 策略 {strategy['name']} 执行出错: {e}")

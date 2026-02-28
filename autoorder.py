@@ -29,6 +29,7 @@ CONFIG = {
     "COINBASE_WS": "wss://ws-feed.exchange.coinbase.com",
     "BINANCE_WS": "wss://stream.binance.com:9443/ws/btcusdt@trade",
     "ORDER_AMOUNT": float(os.getenv("POLY_ORDER_AMOUNT", 3.0)),
+    "ORDER_AMOUNT_15M": float(os.getenv("POLY_ORDER_AMOUNT_15M", 2.0)),
     "SIMULATION_MODE": False,
     "PRICE_OFFSET": float(os.getenv("POLY_PRICE_OFFSET", 0.0)),
     "SETTLE_INTERVAL": int(os.getenv("POLY_SETTLE_INTERVAL", 600)),
@@ -290,6 +291,21 @@ class BotRunner(threading.Thread):
     def trigger_trade(self, side, reason, price, net, fluc, size_multiplier=1.0):
         logger.warning(f"[{self.name}] 触发: {reason} | {side} | {size_multiplier}x")
 
+        # 记录 15m 策略的所有触发信号 (无论成功与否)
+        if self.market_type == "15m":
+            try:
+                log_file = "trigger_history_15m.csv"
+                file_exists = os.path.isfile(log_file)
+                with open(log_file, "a") as f:
+                    if not file_exists:
+                        f.write("Time,MarketID,Side,BTC_Price,Net,Fluc,Reason,Multiplier\n")
+
+                    mid = self.state.active_market['id'] if self.state.active_market else "Unknown"
+                    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    f.write(f"{now_str},{mid},{side},{price},{net},{fluc},{reason},{size_multiplier}\n")
+            except Exception as ex:
+                logger.error(f"[{self.name}] 记录触发日志失败: {ex}")
+
         if CONFIG["SIMULATION_MODE"]:
             self.state.has_traded = True
             logger.info("模拟模式：跳过实际下单。")
@@ -328,7 +344,11 @@ class BotRunner(threading.Thread):
             decimals = len(tick_size_str.split(".")[1]) if "." in tick_size_str else 2
 
             safe_prob = prob if prob > 0.01 else 0.01
-            target_amount = CONFIG["ORDER_AMOUNT"] * size_multiplier
+
+            # 根据市场类型选择基础下单金额
+            base_amount = CONFIG["ORDER_AMOUNT_15M"] if self.market_type == "15m" else CONFIG["ORDER_AMOUNT"]
+            target_amount = base_amount * size_multiplier
+
             size_val = round(target_amount / safe_prob, decimals)
 
             order_args = OrderArgs(price=limit_price, size=size_val, side=BUY, token_id=token_id)
@@ -355,7 +375,7 @@ class BotRunner(threading.Thread):
 
                         signed = temp_client.create_order(order_args)
                         resp = temp_client.post_order(signed)
-                        logger.info(f"下单成功: {resp}")
+                        logger.info(f"[{self.name}] 下单成功: {resp}")
 
                         log_order_to_file(
                             self.state.active_market['id'], reason, side, limit_price, prob,
@@ -381,11 +401,11 @@ class BotRunner(threading.Thread):
                             is_retry = True
 
                         if is_retry and attempt < max_retries - 1:
-                            logger.warning(f"下单错误 ({err_str})，重试...")
+                            logger.warning(f"[{self.name}] 下单错误 ({err_str})，重试...")
                             time.sleep(delay)
                             continue
 
-                        logger.warning(f"下单失败: {e}")
+                        logger.warning(f"[{self.name}] 下单失败: {e}")
                         break
 
                 if current_error: last_error = current_error
@@ -408,7 +428,8 @@ class BotRunner(threading.Thread):
                     self.state.start_time = get_market_start_time(m['question'])
 
                     hist_price = get_coinbase_open_price(self.state.start_time)
-                    if not hist_price and self.market_type == "5m":
+                    if not hist_price:
+                        # 尝试从本地记录读取 (5m bot 负责写入，15m bot 也可以读取)
                         hist_price = self.state.recorder.get_price(self.state.start_time)
 
                     if not hist_price:

@@ -35,8 +35,22 @@ def check(state, config, indicators):
     if fluctuation > vol_limit and abs(net_change) > net_limit and abs(net_change) > abs_limit_usd:
         side = "YES" if net_change > 0 else "NO"
 
-        # 简单过滤：反向指标确认 (可选，这里先不加 RSI/MACD 强限制，保持纯动量)
-        # 如果需要，可以参照 5m 策略添加 RSI < 80 (买入) / RSI > 20 (卖出) 等
+        # RSI/MACD 过滤
+        rsi = indicators['rsi']
+        macd_tuple = indicators.get('macd', (0,0,0))
+        hist = macd_tuple[2]
+        macd_thresh = config.get("MACD_THRESHOLD", -1.0)
+
+        is_valid = False
+        if side == "YES":
+            if rsi < 85 and hist > macd_thresh:
+                is_valid = True
+        else:
+            if rsi > 15 and hist < -macd_thresh:
+                is_valid = True
+
+        if not is_valid:
+            return None
 
         reason_str = f"Condition_2_15M_MOMENTUM (Fluc:{fluctuation:.2f}>{vol_limit:.2f}, Net:{abs(net_change):.2f}>{net_limit:.2f})"
 

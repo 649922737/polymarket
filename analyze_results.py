@@ -31,7 +31,8 @@ def load_all_history():
     dfs = []
     for f in all_files:
         try:
-            df = pd.read_csv(f)
+            # Use on_bad_lines='skip' to ignore malformed rows
+            df = pd.read_csv(f, on_bad_lines='skip')
             # Add filename as source for debugging if needed
             # df['source_file'] = f
             dfs.append(df)
@@ -45,7 +46,10 @@ def load_all_history():
 
     # Ensure timestamp is datetime
     if 'timestamp' in combined_df.columns:
-        combined_df['timestamp'] = pd.to_datetime(combined_df['timestamp'])
+        # errors='coerce' turns invalid dates into NaT
+        combined_df['timestamp'] = pd.to_datetime(combined_df['timestamp'], errors='coerce')
+        # Drop rows with invalid timestamps
+        combined_df = combined_df.dropna(subset=['timestamp'])
         combined_df['date'] = combined_df['timestamp'].dt.date
 
     return combined_df.sort_values('timestamp')

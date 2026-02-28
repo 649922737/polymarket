@@ -1,77 +1,128 @@
-import os
+import requests
 import json
-import glob
+import time
+import pandas as pd
+from datetime import datetime
 
-DATA_DIR = "market_data"
-
-def load_json(path):
-    with open(path, 'r') as f:
-        return json.load(f)
-
-def analyze():
-    # Find 15m files
-    files = glob.glob(os.path.join(DATA_DIR, "fluctuations_15m_*.json"))
-    dates = []
-    for f in files:
-        basename = os.path.basename(f)
-        date_str = basename.replace("fluctuations_15m_", "").replace(".json", "")
-        dates.append(date_str)
-
-    dates.sort()
-
-    if not dates:
-        print("No 15m data files found. Please run generate_15m_data.py first.")
+def analyze_15m():
+    filename = "trade_history_15m_2026-02-28.csv"
+    try:
+        with open(filename, 'r') as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print(f"未找到 {filename}")
         return
 
-    print(f"{'Date':<12} | {'Avg Fluc':<10} | {'Avg Net':<10} | {'Avg |Net|':<10} | {'Count':<5}")
-    print("-" * 65)
+    print(f"加载了 {len(lines)-1} 条记录。")
 
-    total_fluc = []
-    total_net = []
-    total_abs_net = []
+    results = []
+    market_cache = {}
 
-    for date_str in dates:
-        fluc_file = os.path.join(DATA_DIR, f"fluctuations_15m_{date_str}.json")
-        net_file = os.path.join(DATA_DIR, f"net_changes_15m_{date_str}.json")
+    # Skip header
+    for line in lines[1:]:
+        line = line.strip()
+        if not line: continue
 
-        if not os.path.exists(net_file):
-            continue
+        parts = line.split(',')
+        timestamp_str = parts[0]
+        market_id = parts[1]
+        side = parts[-6]
+        poly_price = float(parts[-4])
 
-        fluc_data = load_json(fluc_file)
-        net_data = load_json(net_file)
+        condition_parts = parts[2:-6]
+        condition = ",".join(condition_parts)
 
-        fluc_vals = list(fluc_data.values())
-        net_vals = list(net_data.values())
+        if "(" in condition:
+            cond_name = condition.split("(")[0].strip()
+        else:
+            cond_name = condition
 
-        # Ensure we align them or just take all values (assuming keys match)
-        # Since generated script matches keys, just taking values is fine usually,
-        # but let's be safe and use keys intersection
-        keys = sorted(list(set(fluc_data.keys()) & set(net_data.keys())))
+        # Parse timestamp
+        try:
+            dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+            minute_in_cycle = dt.minute % 15
+        except:
+            minute_in_cycle = -1
 
-        if not keys:
-            continue
+        # --- 查询逻辑 ---
+        mid = market_id
+        try:
+            if mid in market_cache:
+                market = market_cache[mid]
+            else:
+                url = f"https://gamma-api.polymarket.com/markets/{mid}"
+                resp = requests.get(url, timeout=5)
+                if resp.status_code != 200:
+                    continue
+                market = resp.json()
+                market_cache[mid] = market
+                time.sleep(0.1)
 
-        f_vals = [fluc_data[k] for k in keys]
-        n_vals = [net_data[k] for k in keys]
-        an_vals = [abs(x) for x in n_vals]
+            if not market.get('closed'): continue
 
-        avg_fluc = sum(f_vals) / len(f_vals)
-        avg_net = sum(n_vals) / len(n_vals)
-        avg_abs_net = sum(an_vals) / len(an_vals)
-        count = len(keys)
+            raw_prices = market.get('outcomePrices', '[]')
+            raw_outcomes = market.get('outcomes', '[]')
 
-        total_fluc.extend(f_vals)
-        total_net.extend(n_vals)
-        total_abs_net.extend(an_vals)
+            if isinstance(raw_prices, str): prices = json.loads(raw_prices)
+            else: prices = raw_prices
 
-        print(f"{date_str:<12} | {avg_fluc:<10.2f} | {avg_net:<10.2f} | {avg_abs_net:<10.2f} | {count:<5}")
+            if isinstance(raw_outcomes, str): outcomes = json.loads(raw_outcomes)
+            else: outcomes = raw_outcomes
 
-    print("-" * 65)
-    if total_fluc:
-        avg_f = sum(total_fluc) / len(total_fluc)
-        avg_n = sum(total_net) / len(total_net)
-        avg_an = sum(total_abs_net) / len(total_abs_net)
-        print(f"{'TOTAL':<12} | {avg_f:<10.2f} | {avg_n:<10.2f} | {avg_an:<10.2f} | {len(total_fluc):<5}")
+            winner = None
+            for i, p in enumerate(prices):
+                if float(p) > 0.9:
+                    winner = outcomes[i]
+                    break
+
+            if not winner: continue
+
+            winner = winner.upper()
+            if winner in ["TRUE", "1", "YES", "UP"]: winner = "YES"
+            elif winner in ["FALSE", "0", "NO", "DOWN"]: winner = "NO"
+
+            is_win = (side == winner)
+
+            res_item = {
+                "status": "resolved",
+                "result": "win" if is_win else "loss",
+                "condition": cond_name,
+                "minute_in_cycle": minute_in_cycle,
+                "poly_price": poly_price
+            }
+            results.append(res_item)
+
+            if not is_win:
+                print(f"❌ [LOSS] {mid} | Min:{minute_in_cycle:02d} | Prob:{poly_price:.2f} | {cond_name}")
+
+        except Exception as e:
+            print(f"Error {mid}: {e}")
+
+    # Stats
+    res_df = pd.DataFrame(results)
+    if res_df.empty:
+        print("无结果。")
+        return
+
+    wins = len(res_df[res_df['result']=='win'])
+    total = len(res_df)
+    losses = res_df[res_df['result']=='loss']
+
+    print(f"\n15m 总体胜率: {wins}/{total} ({wins/total*100:.2f}%)")
+
+    print("\n【失败订单 - 周期内分钟分布 (0-14)】")
+    # Count losses per minute
+    loss_counts = losses['minute_in_cycle'].value_counts().sort_index()
+
+    for minute in range(15):
+        count = loss_counts.get(minute, 0)
+        # Visual bar
+        bar = "#" * count
+        print(f"Min {minute:02d}: {count} {bar}")
+
+    print("\n【失败订单 - 入场概率分布】")
+    high_prob_losses = len(losses[losses['poly_price'] > 0.8])
+    print(f"入场概率 > 0.8 的亏损: {high_prob_losses}/{len(losses)}")
 
 if __name__ == "__main__":
-    analyze()
+    analyze_15m()
