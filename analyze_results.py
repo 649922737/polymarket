@@ -80,12 +80,23 @@ def analyze():
 
     # Filter by date if requested
     if args.date:
-        target_date = parse_date(args.date)
-        if target_date:
-            df = df[df['date'] == target_date]
-            print(f"Filtering for date: {target_date}")
-        else:
-            print(f"Invalid date format: {args.date}. Please use YYYY-MM-DD or YYYYMMDD.")
+        # Use simple string matching for CSV filtering
+        target_date_str = args.date.replace("-", "")
+        # But we need YYYY-MM-DD for comparison if using datetime objects
+        # Let's just pass the string to the loading logic? No, load_all_history loads everything.
+
+        # Simpler: filter the DF
+        try:
+            # Normalize input to YYYY-MM-DD
+            if len(args.date) == 8: # YYYYMMDD
+                d = datetime.strptime(args.date, "%Y%m%d").date()
+            else:
+                d = datetime.strptime(args.date, "%Y-%m-%d").date()
+
+            df = df[df['date'] == d]
+            print(f"Filtering for date: {d}")
+        except:
+            print(f"Invalid date format: {args.date}")
             return
 
     if args.start:

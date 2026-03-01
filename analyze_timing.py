@@ -25,27 +25,32 @@ def load_history(start_date_str, end_date_str):
 
     dfs = []
     for f in all_files:
+        # Load file
         try:
             df = pd.read_csv(f)
+            # Ensure timestamp is parsed correctly
+            if 'timestamp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                # Filter by date range first to speed up
+                start_ts = pd.to_datetime(start_date_str)
+                end_ts = pd.to_datetime(end_date_str) + pd.Timedelta(days=1)
+                df = df[(df['timestamp'] >= start_ts) & (df['timestamp'] < end_ts)]
+
             dfs.append(df)
-        except:
+        except Exception as e:
+            # print(f"Skipping {f}: {e}")
             pass
 
     if not dfs:
         return pd.DataFrame()
 
     combined_df = pd.concat(dfs, ignore_index=True)
-    if 'timestamp' in combined_df.columns:
-        combined_df['timestamp'] = pd.to_datetime(combined_df['timestamp'])
-        combined_df['date'] = combined_df['timestamp'].dt.date
 
     # Drop duplicates
-    combined_df = combined_df.drop_duplicates(subset=['timestamp', 'market_id', 'condition'])
+    if not combined_df.empty:
+        combined_df = combined_df.drop_duplicates(subset=['timestamp', 'market_id', 'condition'])
 
-    start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-    end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
-
-    return combined_df[(combined_df['date'] >= start_date) & (combined_df['date'] <= end_date)]
+    return combined_df
 
 def analyze_timing(start_date_str, end_date_str):
     df = load_history(start_date_str, end_date_str)
@@ -53,111 +58,78 @@ def analyze_timing(start_date_str, end_date_str):
         print(f"No trades found between {start_date_str} and {end_date_str}")
         return
 
-    print(f"Loaded {len(df)} trades from {start_date_str} to {end_date_str}. Analyzing timing...")
+    # Calculate offset
+    # Assuming 5m cycle starts at HH:00, HH:05, ...
+    # offset = (minute % 5) * 60 + second
 
-    trades = []
-    market_cache = {}
+    df['minute'] = df['timestamp'].dt.minute
+    df['second'] = df['timestamp'].dt.second
+    df['cycle_offset'] = (df['minute'] % 5) * 60 + df['second']
 
-    for index, row in df.iterrows():
-        mid = str(row['market_id'])
-        side = str(row['side']).upper()
-        condition = row['condition']
-        timestamp = row['timestamp']
+    # Fetch outcomes only for necessary trades
+    # To save time, we can group by market_id first
+    market_ids = df['market_id'].unique()
+    market_outcomes = {}
 
-        if isinstance(condition, str) and "(" in condition:
-            clean_condition = condition.split("(")[0].strip()
-        else:
-            clean_condition = condition
+    # Fetch in batches or one by one
+    print(f"Fetching outcomes for {len(market_ids)} markets...")
+    for mid in market_ids:
+        res = get_market_outcome(mid)
+        if res:
+            try:
+                # Parse winner
+                prices = json.loads(res.get('outcomePrices', '[]'))
+                outcomes = json.loads(res.get('outcomes', '[]'))
 
-        if mid in market_cache:
-            market_data = market_cache[mid]
-        else:
-            market_data = get_market_outcome(mid)
-            market_cache[mid] = market_data
-            time.sleep(0.02) # Faster for bulk
+                winner = None
+                if prices and outcomes:
+                    for i, p in enumerate(prices):
+                        if float(p) > 0.95: # Settlement price usually 1.0, but check > 0.95
+                            winner = outcomes[i]
+                            break
 
-        if not market_data:
-            continue
+                if winner:
+                    w = winner.upper()
+                    if w in ["YES", "UP", "TRUE", "1"]: market_outcomes[mid] = "YES"
+                    elif w in ["NO", "DOWN", "FALSE", "0"]: market_outcomes[mid] = "NO"
+            except:
+                pass
 
-        try:
-            raw_prices = market_data.get('outcomePrices', '[]')
-            raw_outcomes = market_data.get('outcomes', '[]')
+    # Calculate win/loss
+    df['outcome'] = df['market_id'].map(market_outcomes)
+    df = df.dropna(subset=['outcome']) # Only settled markets
 
-            if isinstance(raw_prices, str):
-                prices = json.loads(raw_prices)
-            else:
-                prices = raw_prices
+    df['is_win'] = df['side'] == df['outcome']
 
-            if isinstance(raw_outcomes, str):
-                outcomes = json.loads(raw_outcomes)
-            else:
-                outcomes = raw_outcomes
+    # Filter < 120s
+    early_trades = df[df['cycle_offset'] < 120]
+    total_trades = len(df)
+    total_early = len(early_trades)
 
-            winner = None
-            for i, p in enumerate(prices):
-                if float(p) > 0.9:
-                    winner = outcomes[i]
-                    break
+    print(f"\nAnalysis for {start_date_str} to {end_date_str}")
+    print(f"Total Settled Trades: {total_trades}")
+    print(f"Early Trades (<120s): {total_early} ({total_early/total_trades*100:.1f}%)")
 
-            if not winner:
-                continue
+    if total_early > 0:
+        early_wins = len(early_trades[early_trades['is_win']])
+        early_losses = total_early - early_wins
+        win_rate = early_wins / total_early * 100
+        print(f"Early Trades Win Rate: {early_wins}/{total_early} ({win_rate:.2f}%)")
+        print(f"Early Trades Losses: {early_losses}")
 
-            winner = winner.upper()
-            if winner in ["TRUE", "1", "YES", "UP"]:
-                winner = "YES"
-            elif winner in ["FALSE", "0", "NO", "DOWN"]:
-                winner = "NO"
+    # Breakdown by 30s
+    bins = [0, 30, 60, 90, 120, 300]
+    labels = ["0-30s", "30-60s", "60-90s", "90-120s", ">120s"]
+    df['time_bin'] = pd.cut(df['cycle_offset'], bins=bins, labels=labels, right=False)
 
-            is_win = (side == winner)
-
-            trades.append({
-                "timestamp": timestamp,
-                "condition": clean_condition,
-                "is_win": is_win
-            })
-
-        except Exception as e:
-            print(f"Error parsing {mid}: {e}")
-
-    if not trades:
-        print("No analyzed trades found.")
-        return
-
-    trade_df = pd.DataFrame(trades)
-
-    trade_df['minute'] = trade_df['timestamp'].dt.minute
-    trade_df['second'] = trade_df['timestamp'].dt.second
-    trade_df['cycle_offset_seconds'] = (trade_df['minute'] % 5) * 60 + trade_df['second']
-
-    # 0-60s vs >60s analysis
-    early_trades = trade_df[trade_df['cycle_offset_seconds'] < 60]
-    late_trades = trade_df[trade_df['cycle_offset_seconds'] >= 60]
-
-    print("\n=== Win Rate by Timing (0-60s vs >60s) ===")
-
-    def print_stats(name, df):
-        total = len(df)
-        wins = len(df[df['is_win']])
-        losses = total - wins
-        rate = (wins / total * 100) if total > 0 else 0
-        print(f"{name:<15} | Total: {total:<4} | Wins: {wins:<3} | Losses: {losses:<3} | Win Rate: {rate:.2f}%")
-
-    print_stats("Early (<60s)", early_trades)
-    print_stats("Late (>=60s)", late_trades)
-
-    print("\n=== Detailed Breakdown by 30s Bins ===")
-    bins = range(0, 301, 30)
-    labels = [f"{i}-{i+30}s" for i in range(0, 271, 30)]
-    trade_df['cycle_bin'] = pd.cut(trade_df['cycle_offset_seconds'], bins=bins, labels=labels)
-
-    grouped = trade_df.groupby('cycle_bin', observed=False)
+    grouped = df.groupby('time_bin', observed=False)
+    print("\n=== Win Rate by Time Bin ===")
     for name, group in grouped:
-        total = len(group)
-        wins = len(group[group['is_win']])
-        losses = total - wins
-        rate = (wins / total * 100) if total > 0 else 0
-        print(f"{name:<10} | Total: {total:<4} | Wins: {wins:<3} | Losses: {losses:<3} | Win Rate: {rate:.2f}%")
+        t = len(group)
+        w = len(group[group['is_win']])
+        l = t - w
+        rate = (w/t*100) if t > 0 else 0.0
+        print(f"{name:<10} | Total: {t:<4} | Wins: {w:<3} | Losses: {l:<3} | Rate: {rate:.2f}%")
 
 if __name__ == "__main__":
-    # Analyze last 7 days (2026-02-17 to 2026-02-23)
-    analyze_timing("2026-02-17", "2026-02-23")
+    analyze_timing("2026-03-01", "2026-03-01")

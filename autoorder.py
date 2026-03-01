@@ -1,6 +1,7 @@
 import time
 import json
 import os
+import csv
 import threading
 import requests
 import logging
@@ -77,6 +78,12 @@ class MarketState:
         self.last_recorded_minute = -1
         self.market_type = "5m" # Default
 
+        # 新增: 记录当前周期和历史周期数据
+        # cycle_history = [{'max': 100, 'min': 90, 'close': 95}, ...]
+        self.cycle_history = []
+        self.current_cycle_prices = []
+        self.last_cycle_minute = -1
+
         # 初始化 PriceRecorder
         self.recorder = PriceRecorder()
 
@@ -122,10 +129,20 @@ def get_market_start_time(question):
         if ' at ' in question:
             parts = question.split(' at ')
             time_str = parts[-1].split(' ET')[0].strip()
-            now = datetime.now()
-            full_time_str = f"{now.strftime('%Y-%m-%d')} {time_str}"
-            dt = datetime.strptime(full_time_str, '%Y-%m-%d %I:%M%p')
-            return dt
+            # 使用 UTC 时间获取日期，避免本地时间干扰
+            now_utc = datetime.now(timezone.utc)
+            full_time_str = f"{now_utc.strftime('%Y-%m-%d')} {time_str}"
+
+            # 解析时间 (假设是 ET 时间)
+            try:
+                dt_et = datetime.strptime(full_time_str, '%Y-%m-%d %I:%M%p')
+            except ValueError:
+                # 尝试不带 AM/PM 的格式 (虽然不太可能)
+                dt_et = datetime.strptime(full_time_str, '%Y-%m-%d %H:%M')
+
+            # ET -> UTC
+            dt_utc = dt_et.replace(tzinfo=timezone(timedelta(hours=-5))).astimezone(timezone.utc)
+            return dt_utc
 
         return None
     except Exception as e:
@@ -205,9 +222,66 @@ class BotRunner(threading.Thread):
         self.state.current_price = price
         self.state.last_price_update_time = time.time()
 
-        # 仅 5m runner 负责记录 raw price，避免冲突
+        # 维护当前周期数据
+        self.state.current_cycle_prices.append(price)
+
+        # 5m Runner 和 15m Runner 都需要维护 cycle_history
+        now_utc = datetime.now(timezone.utc)
+
+        # 确定周期长度 (秒)
+        cycle_len = self.interval_sec # 300 for 5m, 900 for 15m
+
+        # 计算当前时间属于哪个周期 Key
+        current_cycle_key = int(now_utc.timestamp() // cycle_len)
+
+        # 如果检测到周期切换
+        if self.state.last_cycle_minute != -1 and current_cycle_key != self.state.last_cycle_minute:
+            if self.state.current_cycle_prices:
+                # 归档上一个周期的数据
+                cycle_max = max(self.state.current_cycle_prices)
+                cycle_min = min(self.state.current_cycle_prices)
+                cycle_close = self.state.current_cycle_prices[-1] # 最后一个价格
+
+                record = {'max': cycle_max, 'min': cycle_min, 'close': cycle_close}
+                self.state.cycle_history.append(record)
+
+                # Only keep recent 10 cycles in memory
+                if len(self.state.cycle_history) > 10:
+                    self.state.cycle_history.pop(0)
+
+                logger.info(f"[{self.name}] 周期结束，归档数据: {record}")
+
+                # ------------------------------------------------------------------
+                # Save full OHLC to CSV (market_cycles_*.csv)
+                # ------------------------------------------------------------------
+                try:
+                    cycle_start_ts = self.state.last_cycle_minute * cycle_len
+                    cycle_time = datetime.fromtimestamp(cycle_start_ts, tz=timezone.utc)
+                    cycle_time_str = cycle_time.strftime("%Y-%m-%d %H:%M:%S")
+
+                    cycle_open = self.state.current_cycle_prices[0]
+
+                    csv_file = f"market_cycles_{self.market_type}.csv"
+                    file_exists = os.path.isfile(csv_file)
+
+                    with open(csv_file, 'a', newline='') as f:
+                        writer = csv.writer(f)
+                        if not file_exists:
+                            writer.writerow(["Timestamp", "Open", "High", "Low", "Close"])
+                        writer.writerow([cycle_time_str, cycle_open, cycle_max, cycle_min, cycle_close])
+
+                    # logger.info(f"[{self.name}] Cycle saved to {csv_file}") # Optional extra log
+
+                except Exception as e:
+                    logger.error(f"[{self.name}] Save cycle failed: {e}")
+
+                # 清空当前周期
+                self.state.current_cycle_prices = [price]
+
+        self.state.last_cycle_minute = current_cycle_key
+
+        # 仅 5m runner 负责记录 raw price 到本地文件，避免冲突
         if self.market_type == "5m":
-            now_utc = datetime.now(timezone.utc)
             if now_utc.minute % 5 == 0 and now_utc.second < 15:
                 minute_key = now_utc.strftime("%Y%m%d%H%M")
                 if self.state.last_recorded_minute != minute_key:
@@ -291,47 +365,83 @@ class BotRunner(threading.Thread):
     def trigger_trade(self, side, reason, price, net, fluc, size_multiplier=1.0):
         logger.warning(f"[{self.name}] 触发: {reason} | {side} | {size_multiplier}x")
 
-        # 记录 15m 策略的所有触发信号 (无论成功与否)
-        if self.market_type == "15m":
-            try:
-                log_file = "trigger_history_15m.csv"
-                file_exists = os.path.isfile(log_file)
-                with open(log_file, "a") as f:
-                    if not file_exists:
-                        f.write("Time,MarketID,Side,BTC_Price,Net,Fluc,Reason,Multiplier\n")
-
-                    mid = self.state.active_market['id'] if self.state.active_market else "Unknown"
-                    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    f.write(f"{now_str},{mid},{side},{price},{net},{fluc},{reason},{size_multiplier}\n")
-            except Exception as ex:
-                logger.error(f"[{self.name}] 记录触发日志失败: {ex}")
-
-        if CONFIG["SIMULATION_MODE"]:
-            self.state.has_traded = True
-            logger.info("模拟模式：跳过实际下单。")
-            return
+        # ------------------------------------------------------------------
+        # 1. 预先计算/获取概率和金额，以便记录到 trigger_history
+        # ------------------------------------------------------------------
+        prob = 0.0
+        target_amount = 0.0
+        token_id = None
 
         try:
-            raw_ids = self.state.active_market.get('clobTokenIds')
-            raw_outcomes = self.state.active_market.get('outcomes')
+            # 获取 token_id
+            if self.state.active_market:
+                raw_ids = self.state.active_market.get('clobTokenIds')
+                raw_outcomes = self.state.active_market.get('outcomes')
 
-            if isinstance(raw_ids, str): token_ids = json.loads(raw_ids)
-            else: token_ids = raw_ids
+                if isinstance(raw_ids, str): token_ids = json.loads(raw_ids)
+                else: token_ids = raw_ids
 
-            yes_index = 1
-            no_index = 0
-            if raw_outcomes:
-                try:
-                    outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
-                    for i, label in enumerate(outcomes):
-                        l = label.lower()
-                        if l == "yes" or l == "up": yes_index = i
-                        elif l == "no" or l == "down": no_index = i
-                except: pass
+                yes_index = 1
+                no_index = 0
+                if raw_outcomes:
+                    try:
+                        outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+                        for i, label in enumerate(outcomes):
+                            l = label.lower()
+                            if l == "yes" or l == "up": yes_index = i
+                            elif l == "no" or l == "down": no_index = i
+                    except: pass
 
-            token_id = token_ids[yes_index] if side == "YES" else token_ids[no_index]
+                token_id = token_ids[yes_index] if side == "YES" else token_ids[no_index]
 
-            prob = self.get_market_probability(token_id)
+                # 获取概率
+                if token_id:
+                    prob = self.get_market_probability(token_id)
+
+                # 计算金额
+                base_amount = CONFIG["ORDER_AMOUNT_15M"] if self.market_type == "15m" else CONFIG["ORDER_AMOUNT"]
+                target_amount = base_amount * size_multiplier
+
+        except Exception as e:
+            logger.error(f"[{self.name}] 预计算概率/金额失败: {e}")
+
+        # ------------------------------------------------------------------
+        # 2. 记录触发日志 (增加 Prob 和 Amount)
+        # ------------------------------------------------------------------
+        try:
+            # 文件名: trigger_history_5m.csv 或 trigger_history_15m.csv
+            suffix = "_15m" if self.market_type == "15m" else "_5m"
+            log_file = f"trigger_history{suffix}.csv"
+
+            file_exists = os.path.isfile(log_file)
+            with open(log_file, "a") as f:
+                if not file_exists:
+                    f.write("Time,MarketID,Side,BTC_Price,Net,Fluc,Reason,Multiplier,Prob,Amount\n")
+
+                mid = self.state.active_market['id'] if self.state.active_market else "Unknown"
+                now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                # 记录 Prob 和 Amount
+                f.write(f"{now_str},{mid},{side},{price},{net},{fluc},{reason},{size_multiplier},{prob:.4f},{target_amount:.2f}\n")
+        except Exception as ex:
+            logger.error(f"[{self.name}] 记录触发日志失败: {ex}")
+
+        # ------------------------------------------------------------------
+        # 3. 检查模拟模式
+        # ------------------------------------------------------------------
+        if CONFIG["SIMULATION_MODE"]:
+            self.state.has_traded = True
+            logger.info(f"模拟模式：跳过实际下单 (Prob={prob:.4f}, Amount={target_amount:.2f})。")
+            return
+
+        if not token_id:
+            logger.error(f"[{self.name}] 无法获取 Token ID，跳过下单。")
+            self.state.has_traded = True
+            return
+
+        # ------------------------------------------------------------------
+        # 4. 实际下单逻辑
+        # ------------------------------------------------------------------
+        try:
             logger.info(f"[{self.name}] Prob: {prob:.4f}")
 
             if prob >= strategy_executor.STRATEGY_CONFIG["MAX_PROB"]:
@@ -345,10 +455,7 @@ class BotRunner(threading.Thread):
 
             safe_prob = prob if prob > 0.01 else 0.01
 
-            # 根据市场类型选择基础下单金额
-            base_amount = CONFIG["ORDER_AMOUNT_15M"] if self.market_type == "15m" else CONFIG["ORDER_AMOUNT"]
-            target_amount = base_amount * size_multiplier
-
+            # 使用之前计算的 target_amount
             size_val = round(target_amount / safe_prob, decimals)
 
             order_args = OrderArgs(price=limit_price, size=size_val, side=BUY, token_id=token_id)
@@ -441,7 +548,14 @@ class BotRunner(threading.Thread):
 
                     offset = CONFIG.get("PRICE_OFFSET", 0.0)
                     self.state.start_price = hist_price - offset
-                    self.state.price_history = [self.state.current_price]
+
+                    # 修复：防止 current_price 为 0 导致 min_p 为 0，从而使 fluctuation 异常大
+                    if self.state.current_price > 0:
+                        self.state.price_history = [self.state.current_price]
+                    else:
+                        # 如果还没收到 WS 推送，先用 start_price 占位
+                        self.state.price_history = [self.state.start_price]
+
                     self.state.has_traded = False
                     self.state.reversal_count = 0
                     self.state.last_side_sign = 0

@@ -165,12 +165,22 @@ def execute_strategy(state, strategies, trigger_callback):
     cur_p = state.current_price
     start_p = state.start_price
 
-    # 将 start_price 加入计算范围，以正确反映从开盘以来的波动
-    # 如果 price_history 为空，则使用 cur_p 和 start_p
-    effective_history = state.price_history + [start_p] if state.price_history else [cur_p, start_p]
+    # 过滤掉 0 值，防止波动计算错误 (例如程序刚启动还未收到 WS 推送)
+    valid_prices = [p for p in state.price_history if p > 0]
+    if not valid_prices:
+        valid_prices = [start_p]
 
-    max_p = max(effective_history)
-    min_p = min(effective_history)
+    # 确保 cur_p 也参与计算 (如果 valid_prices 里没有最新的)
+    if cur_p > 0 and cur_p not in valid_prices:
+        valid_prices.append(cur_p)
+
+    # 将 start_price 加入计算范围，以正确反映从开盘以来的波动
+    # 再次确保 start_p 也被包含
+    if start_p > 0 and start_p not in valid_prices:
+        valid_prices.append(start_p)
+
+    max_p = max(valid_prices)
+    min_p = min(valid_prices)
 
     fluctuation = max_p - min_p
     net_change = cur_p - start_p

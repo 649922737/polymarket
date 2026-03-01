@@ -34,7 +34,7 @@ except ImportError:
 
 def get_avg_fluctuation_past_5_cycles(start_time, interval_minutes, recorder):
     """
-    获取过去 5 个周期 (每个 interval_minutes) 的平均波动值
+    获取过去 5 个周期 (每个 interval_minutes) 的平均波动值 (High-Low)
     """
     if not recorder:
         return None

@@ -1,26 +1,52 @@
 """
-策略: Condition 2 - 全程动量 (Momentum)
-优先级: 2 (由文件名决定)
+策略: Condition 2 - 趋势突破 (Trend Breakout)
+优先级: 2
 
 逻辑:
 - 时间: 全程有效
 - 条件:
-  1. 价格波动 (fluctuation) > 0.15% (VOL_THRESHOLD_PCT)
-  2. 净变化绝对值 (abs(net_change)) > 0.05% (NET_CHANGE_PCT)
-- 动作: 顺势下单 (net_change > 0 买 YES, < 0 买 NO)
+  1. 上升趋势: 当前价格 > 前3个周期历史最高价 + (当前价格 * 0.1%) -> 买 YES
+  2. 下降趋势: 当前价格 < 前3个周期历史最低价 - (当前价格 * 0.1%) -> 买 NO
+- 数据源: 运行时内存维护的 state.cycle_history (包含 max, min, close)
+- 历史: 仅依赖运行时收集的数据，不依赖本地文件或估算
 """
 
+import logging
+
+logger = logging.getLogger("PolyBot")
+
 def check(state, config, indicators):
-    fluctuation = indicators['fluctuation']
-    net_change = indicators['net_change']
-    start_p = state.start_price
+    # 此策略只适用于 5m 市场
+    if getattr(state, "market_type", "5m") != "5m":
+        return None
 
-    vol_limit = start_p * config["VOL_THRESHOLD_PCT"]
-    net_limit_early = start_p * config["NET_CHANGE_PCT"]
-    abs_limit = config.get("MIN_ABS_CHANGE", 0)
+    current_p = state.current_price
+    if current_p <= 0: return None
 
-    if fluctuation > vol_limit and abs(net_change) > net_limit_early and abs(net_change) > abs_limit:
-        side = "YES" if net_change > 0 else "NO"
+    # 从 state.cycle_history 获取数据
+    # cycle_history = [{'max': 100, 'min': 90, 'close': 95}, ...]
+    history = getattr(state, "cycle_history", [])
+
+    # 如果数据不足 3 个周期，直接跳过 (冷启动)
+    if len(history) < 3:
+        # logger.debug(f"Condition2: Not enough cycle history ({len(history)}/3)")
+        return None
+
+    # 获取前 3 个完整周期的极值
+    # 注意: cycle_history[-1] 是最近的一个完整周期
+    # 取最后 3 个
+    past_3_cycles = history[-3:]
+
+    max_h = max(c['max'] for c in past_3_cycles)
+    min_l = min(c['min'] for c in past_3_cycles)
+
+    # 阈值: 当前价格的 0.1%
+    threshold = current_p * 0.001
+
+    # 1. 上升突破
+    if current_p > (max_h + threshold):
+        side = "YES"
+        reason = f"Condition_2_BREAK_UP (Cur:{current_p:.2f} > Max:{max_h:.2f} + {threshold:.2f})"
 
         # RSI/MACD 确认
         rsi = indicators['rsi']
@@ -28,28 +54,30 @@ def check(state, config, indicators):
         hist = macd_tuple[2]
         macd_thresh = config.get("MACD_THRESHOLD", 0)
 
-        is_valid = False
-        if side == "YES":
-            if rsi < 80 and hist > macd_thresh:
-                is_valid = True
-        else:
-            # 对称阈值: YES > -1, NO < 1
-            if rsi > 20 and hist < -macd_thresh:
-                is_valid = True
-
-        if is_valid:
-            # 检查是否触发双倍单逻辑
-            # 当净变化绝对值 > 0.2% (start_p * 0.002) 时，下单两倍
-            size_mult = 1.0
-            double_limit = start_p * 0.002
-            if abs(net_change) > double_limit:
-                size_mult = 2.0
-
+        if rsi < 80 and hist > macd_thresh:
             return {
                 "action": "trade",
-                "side": side,
-                "reason": "Condition_2_MOMENTUM",
-                "size_multiplier": size_mult
+                "side": "YES",
+                "reason": reason,
+                "size_multiplier": 1.0
+            }
+
+    # 2. 下降突破
+    elif current_p < (min_l - threshold):
+        side = "NO"
+        reason = f"Condition_2_BREAK_DOWN (Cur:{current_p:.2f} < Min:{min_l:.2f} - {threshold:.2f})"
+
+        rsi = indicators['rsi']
+        macd_tuple = indicators.get('macd', (0,0,0))
+        hist = macd_tuple[2]
+        macd_thresh = config.get("MACD_THRESHOLD", 0)
+
+        if rsi > 20 and hist < -macd_thresh:
+            return {
+                "action": "trade",
+                "side": "NO",
+                "reason": reason,
+                "size_multiplier": 1.0
             }
 
     return None
