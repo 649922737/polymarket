@@ -1,32 +1,113 @@
 import csv
-import requests
-import json
-import time
 import os
-from datetime import datetime
+import argparse
+import glob
+from datetime import datetime, timedelta
+from collections import defaultdict
 
 # Configuration
-TARGET_DATE = "2026-03-02"
-FILES = ["trigger_history_5m.csv", "trigger_history_15m.csv"]
-GAMMA_API = "https://gamma-api.polymarket.com"
-MAX_PROB_FILTER = 0.90 # Filter trades with Prob > this value
+INTERVALS = ["5m", "15m"]  # 时间间隔
 
-def get_market_outcome(market_id):
-    try:
-        url = f"{GAMMA_API}/markets/{market_id}"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception as e:
-        pass
+# 时间间隔映射（分钟）
+INTERVAL_MINUTES = {
+    "5m": 5,
+    "15m": 15
+}
+
+# 时区配置
+# trigger_history 使用 UTC+8（北京时间）
+# market_cycles 使用 UTC 时间
+TRIGGER_TIMEZONE_OFFSET = 8  # UTC+8
+
+def load_market_cycles(filepath):
+    """
+    加载市场周期数据
+
+    Args:
+        filepath: market_cycles CSV文件路径
+
+    Returns:
+        dict: {timestamp: {'Open': float, 'High': float, 'Low': float, 'Close': float}}
+    """
+    cycles = {}
+    if not os.path.exists(filepath):
+        return cycles
+
+    with open(filepath, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                timestamp = datetime.strptime(row['Timestamp'], "%Y-%m-%d %H:%M:%S")
+                cycles[timestamp] = {
+                    'Open': float(row['Open']),
+                    'High': float(row['High']),
+                    'Low': float(row['Low']),
+                    'Close': float(row['Close'])
+                }
+            except:
+                continue
+
+    return cycles
+
+def get_cycle_data(trade_time, cycles, interval_minutes):
+    """
+    获取交易时间之前最近完成的周期数据
+
+    Args:
+        trade_time: 交易时间（UTC+8）
+        cycles: 市场周期数据（UTC时间）
+        interval_minutes: 时间间隔（分钟）
+
+    Returns:
+        dict: {'Open': float, 'High': float, 'Low': float, 'Close': float} 或 None
+
+    示例：
+        交易时间 00:34:50 (UTC) 在 00:30-00:45 周期内
+        应该查找 00:30 这一行（代表 00:15-00:30 的周期）
+    """
+    # 将交易时间从 UTC+8 转换为 UTC 时间
+    trade_time_utc = trade_time - timedelta(hours=TRIGGER_TIMEZONE_OFFSET)
+
+    # 找到交易所在周期的开始时间
+    # 例如：00:34:50 所在周期是 00:30-00:45，开始时间是 00:30
+    minute = trade_time_utc.minute
+    cycle_start_minute = (minute // interval_minutes) * interval_minutes
+
+    cycle_boundary = trade_time_utc.replace(minute=cycle_start_minute, second=0, microsecond=0)
+
+    # 在cycles中查找这个时间点的周期数据
+    # 这代表的是之前已完成的那个周期
+    if cycle_boundary in cycles:
+        return cycles[cycle_boundary]
+
+    # 如果找不到精确匹配，尝试找最近的过去周期
+    for i in range(1, 10):  # 最多向前查找10个周期
+        test_time = cycle_boundary - timedelta(minutes=interval_minutes * i)
+        if test_time in cycles:
+            return cycles[test_time]
+
     return None
 
-def analyze_file(filepath):
+def analyze_file(filepath, cycles_data, interval, target_date=None, max_prob_filter=None):
+    """
+    分析单个CSV文件（模拟交易）
+
+    Args:
+        filepath: trigger_history CSV文件路径（时间为UTC+8）
+        cycles_data: 市场周期数据（时间为UTC）
+        interval: 时间间隔（5m或15m）
+        target_date: 目标日期(YYYY-MM-DD格式)，None表示分析所有日期
+        max_prob_filter: 最大概率过滤值，None表示不过滤
+    """
     if not os.path.exists(filepath):
         print(f"File {filepath} not found.")
         return None
 
-    print(f"\nAnalyzing {filepath} for {TARGET_DATE}...")
+    date_filter_msg = f"for {target_date}" if target_date else "for all dates"
+    print(f"\nAnalyzing {filepath} {date_filter_msg}...")
+    print(f"  Note: Converting trigger times from UTC+8 to UTC for cycle matching")
+
+    interval_minutes = INTERVAL_MINUTES[interval]
 
     # Read CSV
     rows = []
@@ -34,8 +115,9 @@ def analyze_file(filepath):
         reader = csv.reader(f)
         header = next(reader, None)
 
-        for line_num, row in enumerate(reader, start=2):
-            if not row or len(row) < 3: continue
+        for row in reader:
+            if not row or len(row) < 3:
+                continue
 
             # Parse Time
             time_str = row[0]
@@ -45,15 +127,17 @@ def analyze_file(filepath):
             except:
                 continue
 
-            if date_str != TARGET_DATE:
+            # 如果指定了日期过滤，则只保留该日期的数据
+            if target_date and date_str != target_date:
                 continue
 
-            # Columns (migrated format):
+            # Columns:
             # Time, MarketID, Side, BTC_Price, Net, Fluc, Reason, Multiplier, Prob, Amount
             # 0,    1,        2,    3,         4,   5,    6,      7,          8,    9
 
             mid = row[1]
             side = row[2]
+            btc_price = float(row[3]) if len(row) >= 4 else 0.0
 
             prob = 0.0
             amount = 0.0
@@ -62,12 +146,14 @@ def analyze_file(filepath):
                 try:
                     prob = float(row[8])
                     amount = float(row[9])
-                except: pass
+                except:
+                    pass
 
-            if prob == 0: prob = 0.99
+            if prob == 0:
+                prob = 0.99
 
-            # Filter high probability trades
-            if prob > MAX_PROB_FILTER:
+            # 如果指定了概率过滤，则过滤掉高概率交易
+            if max_prob_filter is not None and prob > max_prob_filter:
                 continue
 
             reason = row[6] if len(row) >= 7 else "Unknown"
@@ -75,99 +161,123 @@ def analyze_file(filepath):
 
             rows.append({
                 "Time": dt,
+                "Date": date_str,
                 "MarketID": mid,
                 "Side": side,
+                "BTC_Price": btc_price,
                 "Condition": condition_name,
                 "Prob": prob,
                 "Amount": amount
             })
 
     if not rows:
-        print(f"No records found for {TARGET_DATE}")
+        filter_msg = f" for {target_date}" if target_date else ""
+        print(f"No records found{filter_msg}")
         return None
 
     print(f"Found {len(rows)} records.")
 
-    # Fetch Outcomes
-    market_cache = {}
+    # 计算模拟交易结果
     results = []
+    resolved_count = 0
+    no_data_count = 0
 
-    print("Fetching outcomes...")
+    print("Calculating simulated trade outcomes...")
     for i, row in enumerate(rows):
-        if i % 10 == 0: print(f"Processing {i}/{len(rows)}...", end='\r')
+        if i % 10 == 0:
+            print(f"Processing {i}/{len(rows)}...", end='\r')
 
-        mid = str(row['MarketID'])
-        if mid in market_cache:
-            m_data = market_cache[mid]
-        else:
-            m_data = get_market_outcome(mid)
-            market_cache[mid] = m_data
-            time.sleep(0.1)
+        # 获取周期数据
+        cycle_data = get_cycle_data(row['Time'], cycles_data, interval_minutes)
 
-        outcome = "Unknown"
-        status = "Pending"
+        if cycle_data is None:
+            # 找不到价格数据，标记为No Data
+            results.append({
+                **row,
+                "Open_Price": None,
+                "Close_Price": None,
+                "Status": "No Data",
+                "Outcome": "Unknown",
+                "Result": "N/A",
+                "PnL": 0.0
+            })
+            no_data_count += 1
+            continue
 
-        if m_data:
-            if m_data.get('closed'):
-                try:
-                    raw_p = m_data.get('outcomePrices', '[]')
-                    raw_o = m_data.get('outcomes', '[]')
-                    prices = json.loads(raw_p) if isinstance(raw_p, str) else raw_p
-                    outcomes = json.loads(raw_o) if isinstance(raw_o, str) else raw_o
+        open_price = cycle_data['Open']
+        close_price = cycle_data['Close']
 
-                    winner_idx = -1
-                    for idx, p in enumerate(prices):
-                        if float(p) > 0.9:
-                            winner_idx = idx
-                            break
-
-                    if winner_idx != -1:
-                        outcome = outcomes[winner_idx].upper()
-                        status = "Resolved"
-                        if outcome in ['YES', 'TRUE', '1', 'UP']: outcome = 'YES'
-                        elif outcome in ['NO', 'FALSE', '0', 'DOWN']: outcome = 'NO'
-                except: pass
-            elif m_data.get('active'):
-                status = "Active"
-
+        # 判断交易结果
+        # 比较周期的开盘价和收盘价，判断涨跌
+        # 涨：Close > Open
+        # 跌：Close < Open
+        # YES交易：预测涨，如果涨则WIN
+        # NO交易：预测跌，如果跌则WIN
         is_win = False
-        pnl = 0.0
+        if row['Side'] == 'YES':
+            is_win = close_price > open_price
+            outcome = 'YES' if close_price > open_price else 'NO'
+        else:  # NO
+            is_win = close_price < open_price
+            outcome = 'NO' if close_price < open_price else 'YES'
 
-        if status == "Resolved":
-            is_win = (row['Side'] == outcome)
-            if is_win:
-                # PnL = Revenue - Cost
-                # Revenue = Amount / Prob (Shares) * 1.0 (Payout is 1.0)
-                # Ensure Prob is safe
-                safe_prob = row['Prob'] if row['Prob'] > 0 else 0.99
-                revenue = row['Amount'] / safe_prob
-                pnl = revenue - row['Amount']
-            else:
-                pnl = -row['Amount']
+        # 计算PnL
+        # 如果赢了：PnL = (Amount / Prob) - Amount = Amount * (1/Prob - 1)
+        # 如果输了：PnL = -Amount
+        if is_win:
+            safe_prob = row['Prob'] if row['Prob'] > 0 else 0.99
+            revenue = row['Amount'] / safe_prob
+            pnl = revenue - row['Amount']
+        else:
+            pnl = -row['Amount']
 
         results.append({
             **row,
-            "Status": status,
+            "Open_Price": open_price,
+            "Close_Price": close_price,
+            "Status": "Resolved",
             "Outcome": outcome,
             "Result": "WIN" if is_win else "LOSS",
             "PnL": pnl
         })
+        resolved_count += 1
 
     print(f"Processing {len(rows)}/{len(rows)}... Done.")
+    if no_data_count > 0:
+        print(f"Warning: {no_data_count} trades have no market cycle data")
 
     return results
 
-def print_stats(filename, results):
-    if not results: return
+def print_stats(filename, results, target_date=None, max_prob_filter=None):
+    """
+    打印统计信息表格
+
+    Args:
+        filename: 文件名
+        results: 分析结果
+        target_date: 目标日期
+        max_prob_filter: 概率过滤值
+    """
+    if not results:
+        return
 
     resolved = [r for r in results if r['Status'] == 'Resolved']
 
-    print("\n" + "="*80)
-    print(f" ANALYSIS: {filename} ({TARGET_DATE})")
-    print("="*80)
+    # 构建标题
+    title_parts = [filename]
+    if target_date:
+        title_parts.append(f"Date: {target_date}")
+    if max_prob_filter is not None:
+        title_parts.append(f"Prob ≤ {max_prob_filter}")
+
+    title = " | ".join(title_parts)
+
+    print("\n" + "="*100)
+    print(f" ANALYSIS: {title}")
+    print("="*100)
 
     if not resolved:
-        print("No resolved trades yet.")
+        print("No resolved trades.")
         return
 
     total_trades = len(resolved)
@@ -184,17 +294,21 @@ def print_stats(filename, results):
     print(f"Total Vol:    ${total_invested:.2f}")
     print(f"ROI:          {roi:+.2f}%")
 
-    print("-" * 80)
-    print(f"{'Strategy':<30} | {'Win Rate':<8} | {'PnL':<8} | {'ROI':<7} | {'W/L':<5} | {'Pend'}")
-    print("-" * 80)
+    print("-" * 100)
+    print(f"{'Strategy':<30} | {'Total Orders':<12} | {'Success Rate':<13} | {'PnL':<12} | {'ROI':<7} | {'W/L':<7}")
+    print("-" * 100)
 
     # Group by Strategy
-    strategies = {}
+    strategies = defaultdict(lambda: {
+        'total': 0,
+        'resolved': 0,
+        'wins': 0,
+        'pnl': 0.0,
+        'invested': 0.0
+    })
+
     for r in results:
         cond = r['Condition']
-        if cond not in strategies:
-            strategies[cond] = {'total': 0, 'resolved': 0, 'wins': 0, 'pnl': 0.0, 'invested': 0.0}
-
         strategies[cond]['total'] += 1
         if r['Status'] == 'Resolved':
             strategies[cond]['resolved'] += 1
@@ -203,24 +317,161 @@ def print_stats(filename, results):
             if r['Result'] == 'WIN':
                 strategies[cond]['wins'] += 1
 
+    # 按策略名称排序
     for strat in sorted(strategies.keys()):
         s = strategies[strat]
-        pending = s['total'] - s['resolved']
+        total_orders = s['total']
 
         if s['resolved'] == 0:
-            print(f"{strat:<30} | {'N/A':<8} | {'$0.00':<8} | {'0.0%':<7} | {'0/0':<5} | {pending}")
+            success_rate = "N/A"
+            pnl_str = "$0.00"
+            roi_str = "0.0%"
+            wl_str = "0/0"
         else:
             rate = (s['wins'] / s['resolved']) * 100
+            success_rate = f"{rate:.1f}%"
+            pnl_str = f"${s['pnl']:+.2f}"
             roi_s = (s['pnl'] / s['invested'] * 100) if s['invested'] > 0 else 0
-            wl = f"{s['wins']}/{s['resolved']-s['wins']}"
-            print(f"{strat:<30} | {rate:5.1f}%   | ${s['pnl']:<7.2f} | {roi_s:>+6.1f}% | {wl:<5} | {pending}")
+            roi_str = f"{roi_s:+.1f}%"
+            wl_str = f"{s['wins']}/{s['resolved']-s['wins']}"
 
-    print("="*80)
+        print(f"{strat:<30} | {total_orders:<12} | {success_rate:<13} | {pnl_str:<12} | {roi_str:<7} | {wl_str:<7}")
+
+    print("="*100)
+
+def load_multi_day_cycles(interval, target_date, days_before=1, days_after=1):
+    """
+    加载多天的市场周期数据
+
+    Args:
+        interval: 时间间隔（5m或15m）
+        target_date: 目标日期
+        days_before: 加载目标日期前几天的数据
+        days_after: 加载目标日期后几天的数据
+
+    Returns:
+        dict: 合并的市场周期数据
+    """
+    all_cycles = {}
+
+    # 解析目标日期
+    target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+
+    # 加载前后几天的数据
+    for day_offset in range(-days_before, days_after + 1):
+        date_to_load = target_dt + timedelta(days=day_offset)
+        date_str = date_to_load.strftime("%Y-%m-%d")
+        cycles_file = f"market_cycles_{interval}_{date_str}.csv"
+
+        if os.path.exists(cycles_file):
+            cycles = load_market_cycles(cycles_file)
+            all_cycles.update(cycles)
+            print(f"  Loaded {len(cycles)} cycles from {cycles_file}")
+
+    return all_cycles
+
+def get_files_to_analyze(target_date=None):
+    """
+    获取需要分析的文件列表
+
+    Args:
+        target_date: 目标日期(YYYY-MM-DD格式)，None表示分析所有日期
+
+    Returns:
+        list: [(trigger_file, interval, target_date_str), ...]
+    """
+    files = []
+
+    if target_date:
+        # 如果指定了日期，查找该日期的文件
+        for interval in INTERVALS:
+            trigger_file = f"trigger_history_{interval}_{target_date}.csv"
+            if os.path.exists(trigger_file):
+                files.append((trigger_file, interval, target_date))
+            else:
+                print(f"Warning: {trigger_file} not found")
+    else:
+        # 如果没有指定日期，查找所有日期的文件
+        for interval in INTERVALS:
+            pattern = f"trigger_history_{interval}_*.csv"
+            trigger_files = sorted(glob.glob(pattern))
+            for trigger_file in trigger_files:
+                # 从trigger文件名提取日期
+                # trigger_history_5m_2026-03-04.csv -> 2026-03-04
+                parts = trigger_file.replace('.csv', '').split('_')
+                if len(parts) >= 4:
+                    date_part = parts[-3] + '-' + parts[-2] + '-' + parts[-1]
+                    files.append((trigger_file, interval, date_part))
+
+    return files
 
 def main():
-    for f in FILES:
-        res = analyze_file(f)
-        print_stats(f, res)
+    parser = argparse.ArgumentParser(
+        description='分析Polymarket模拟交易PnL',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python analyze_pnl.py                           # 分析所有数据
+  python analyze_pnl.py --date 2026-03-04         # 分析2026-03-04的数据
+  python analyze_pnl.py --prob 0.85               # 分析概率≤0.85的交易
+  python analyze_pnl.py --date 2026-03-04 --prob 0.85  # 组合过滤
+        """
+    )
+
+    parser.add_argument(
+        '--date',
+        type=str,
+        help='指定分析日期 (格式: YYYY-MM-DD)，不指定则分析所有日期'
+    )
+
+    parser.add_argument(
+        '--prob',
+        type=float,
+        help='过滤概率阈值，只分析概率≤此值的交易 (例如: 0.85)'
+    )
+
+    args = parser.parse_args()
+
+    # 验证日期格式
+    if args.date:
+        try:
+            datetime.strptime(args.date, "%Y-%m-%d")
+        except ValueError:
+            print(f"错误: 日期格式不正确，应为 YYYY-MM-DD，例如 2026-03-04")
+            return
+
+    # 验证概率范围
+    if args.prob is not None:
+        if not (0 < args.prob <= 1):
+            print(f"错误: 概率值应在 0 到 1 之间")
+            return
+
+    # 获取需要分析的文件
+    files = get_files_to_analyze(args.date)
+
+    if not files:
+        if args.date:
+            print(f"错误: 未找到日期 {args.date} 的历史文件或周期数据文件")
+        else:
+            print("错误: 未找到任何历史文件或周期数据文件")
+        return
+
+    # 分析每个文件
+    for trigger_file, interval, file_date in files:
+        print(f"\nLoading market cycles data for {interval} around {file_date}...")
+        # 加载多天的市场周期数据（前后各1天，共3天）
+        cycles_data = load_multi_day_cycles(interval, file_date, days_before=1, days_after=1)
+
+        if not cycles_data:
+            print(f"Warning: No market cycle data found for {interval} around {file_date}")
+            continue
+
+        print(f"  Total cycles loaded: {len(cycles_data)}")
+
+        # 分析交易数据
+        res = analyze_file(trigger_file, cycles_data, interval,
+                          target_date=args.date, max_prob_filter=args.prob)
+        print_stats(trigger_file, res, target_date=args.date, max_prob_filter=args.prob)
 
 if __name__ == "__main__":
     main()
