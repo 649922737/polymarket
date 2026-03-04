@@ -192,7 +192,7 @@ def check(state, config, indicators):
 
     # Configs for 5m
     ratio_pct = config.get("PREV_CYCLE_FLUC_PCT_5", 0.8)
-    abs_limit = config.get("PREV_CYCLE_MIN_ABS_5", 45.0)
+    abs_limit = config.get("PREV_CYCLE_MIN_ABS_5", 60.0) # 提高阈值：从 45.0 提到 60.0
     hard_abs_threshold = 140.0
 
     ratio_threshold = prev_fluc * ratio_pct

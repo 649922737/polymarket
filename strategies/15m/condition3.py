@@ -6,7 +6,7 @@
 - 时间: 全程有效
 - 条件:
   1. 当前周期的净值 (abs(net_change)) > 上个周期(15m)波动值 (High-Low) 的 80% (PREV_CYCLE_FLUC_PCT_15)
-  2. 当前周期的净值 (abs(net_change)) > (过去5个周期平均波动 / 2)
+  2. 当前周期的净值 (abs(net_change)) > (0.8*过去5个周期平均波动)
   3. 当前周期的净值 (abs(net_change)) > 当前价格的 0.15% (例如 60000 -> 90.0)
 - 动作: 顺势下单
 """
@@ -126,6 +126,9 @@ def get_prev_cycle_fluctuation(start_time, recorder):
     return None # 实际上 avg 函数的 batch fetch 应该已经覆盖了这里
 
 def check(state, config, indicators):
+    # Condition 3 15m (PREV) 表现不佳，暂时停用
+    return None
+
     # Only run for 15m markets
     if getattr(state, "market_type", "") != "15m":
         return None
@@ -184,8 +187,19 @@ def check(state, config, indicators):
     ratio_pct = config.get("PREV_CYCLE_FLUC_PCT_15", 0.8)
 
     threshold_1 = prev_fluc * ratio_pct
-    threshold_2 = avg_fluc / 2.0
+    threshold_2 = avg_fluc * 0.8
     threshold_3 = state.current_price * 0.0015 # 0.15%
+
+    # 新增：概率保护 (High Probability Protection)
+    # 如果价格已经 > 0.90 (或 < 0.10)，说明行情已经走了很远，盈亏比极差，不再追单
+    current_prob = 0.5
+    if state.order_book and state.order_book.bids:
+        current_prob = float(state.order_book.bids[0].price)
+
+    if net_change > 0 and current_prob > 0.90:
+        return None
+    if net_change < 0 and current_prob < 0.10: # 对应 NO 的价格 > 0.90
+        return None
 
     if current_abs_change > threshold_1 and current_abs_change > threshold_2 and current_abs_change > threshold_3:
         side = "YES" if net_change > 0 else "NO"
@@ -208,7 +222,7 @@ def check(state, config, indicators):
             logger.info(f"Condition3 (15m): Filtered | Side:{side} | RSI:{rsi:.1f} | MACD:{hist:.3f}")
             return None
 
-        reason_str = f"Condition_3_15M_PREV (Net:{current_abs_change:.2f} > {ratio_pct}*Prev({prev_fluc:.2f}) & > Avg/2({threshold_2:.2f}) & > 0.15%({threshold_3:.2f}))"
+        reason_str = f"Condition_3_15M_PREV (Net:{current_abs_change:.2f} > {ratio_pct}*Prev({prev_fluc:.2f}) & > 0.8*Avg({threshold_2:.2f}) & > 0.15%({threshold_3:.2f}))"
 
         return {
             "action": "trade",

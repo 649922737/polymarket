@@ -83,6 +83,7 @@ class MarketState:
         self.cycle_history = []
         self.current_cycle_prices = []
         self.last_cycle_minute = -1
+        self.order_book = None  # Add order_book attribute
 
         # 初始化 PriceRecorder
         self.recorder = PriceRecorder()
@@ -261,7 +262,8 @@ class BotRunner(threading.Thread):
 
                     cycle_open = self.state.current_cycle_prices[0]
 
-                    csv_file = f"market_cycles_{self.market_type}.csv"
+                    date_str = datetime.now().strftime("%Y-%m-%d")
+                    csv_file = f"market_cycles_{self.market_type}_{date_str}.csv"
                     file_exists = os.path.isfile(csv_file)
 
                     with open(csv_file, 'a', newline='') as f:
@@ -409,9 +411,10 @@ class BotRunner(threading.Thread):
         # 2. 记录触发日志 (增加 Prob 和 Amount)
         # ------------------------------------------------------------------
         try:
-            # 文件名: trigger_history_5m.csv 或 trigger_history_15m.csv
+            # 文件名: trigger_history_5m_YYYY-MM-DD.csv 或 trigger_history_15m_YYYY-MM-DD.csv
             suffix = "_15m" if self.market_type == "15m" else "_5m"
-            log_file = f"trigger_history{suffix}.csv"
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            log_file = f"trigger_history{suffix}_{date_str}.csv"
 
             file_exists = os.path.isfile(log_file)
             with open(log_file, "a") as f:

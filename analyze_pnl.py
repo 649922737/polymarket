@@ -1,174 +1,226 @@
 import csv
-import json
 import requests
+import json
 import time
-import logging
-from collections import defaultdict
+import os
+from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format='%(message)s')
-logger = logging.getLogger()
+# Configuration
+TARGET_DATE = "2026-03-02"
+FILES = ["trigger_history_5m.csv", "trigger_history_15m.csv"]
+GAMMA_API = "https://gamma-api.polymarket.com"
+MAX_PROB_FILTER = 0.90 # Filter trades with Prob > this value
 
-def analyze_pnl():
-    trades = []
+def get_market_outcome(market_id):
+    try:
+        url = f"{GAMMA_API}/markets/{market_id}"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        pass
+    return None
+
+def analyze_file(filepath):
+    if not os.path.exists(filepath):
+        print(f"File {filepath} not found.")
+        return None
+
+    print(f"\nAnalyzing {filepath} for {TARGET_DATE}...")
+
     # Read CSV
-    with open('trade_history.csv', 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            trades.append(row)
+    rows = []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
 
-    logger.info(f"Total trades logged: {len(trades)}")
+        for line_num, row in enumerate(reader, start=2):
+            if not row or len(row) < 3: continue
 
-    # Filter for unique markets (assuming one trade per market for now)
-    # If multiple trades per market, we need to handle that.
-    # Logic: Group by market_id
-    market_trades = defaultdict(list)
-    for t in trades:
-        market_trades[t['market_id']].append(t)
-
-    # We will analyze the last 50 markets to save time/API
-    market_ids = list(market_trades.keys())
-    # recent_market_ids = market_ids[-50:]
-    # Analyze ALL for better stats, but handle rate limits
-    recent_market_ids = market_ids
-
-    logger.info(f"Analyzing {len(recent_market_ids)} markets...")
-
-    stats = {
-        "Condition_1": {"wins": 0, "total": 0, "pnl": 0.0},
-        "Condition_2": {"wins": 0, "total": 0, "pnl": 0.0},
-        "Condition_3": {"wins": 0, "total": 0, "pnl": 0.0},
-        "Condition_4": {"wins": 0, "total": 0, "pnl": 0.0},
-        "Condition_5": {"wins": 0, "total": 0, "pnl": 0.0},
-        "Other": {"wins": 0, "total": 0, "pnl": 0.0},
-    }
-
-    processed_count = 0
-
-    for mid in recent_market_ids:
-        try:
-            # Check cache or local logic? No, just API
-            url = f"https://gamma-api.polymarket.com/markets/{mid}"
-            resp = requests.get(url, timeout=5)
-
-            if resp.status_code != 200:
-                logger.warning(f"Failed to fetch market {mid}: {resp.status_code}")
+            # Parse Time
+            time_str = row[0]
+            try:
+                dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+                date_str = dt.strftime("%Y-%m-%d")
+            except:
                 continue
 
-            m = resp.json()
-            if not m.get('closed'):
-                # logger.info(f"Market {mid} not closed yet.")
+            if date_str != TARGET_DATE:
                 continue
 
-            outcome_prices = json.loads(m.get('outcomePrices', '[]'))
-            # Assume Binary: ["0", "1"] or ["1", "0"] or ["0.5", "0.5"] (void)
+            # Columns (migrated format):
+            # Time, MarketID, Side, BTC_Price, Net, Fluc, Reason, Multiplier, Prob, Amount
+            # 0,    1,        2,    3,         4,   5,    6,      7,          8,    9
 
-            winner = None
-            if len(outcome_prices) >= 2:
-                p0 = float(outcome_prices[0])
-                p1 = float(outcome_prices[1])
-                if p0 > 0.9: winner = "NO" # Index 0 usually NO/Down? Wait.
-                elif p1 > 0.9: winner = "YES" # Index 1 usually YES/Up?
+            mid = row[1]
+            side = row[2]
 
-            # Need to verify outcome index mapping.
-            # Usually Index 0 is NO/Down, Index 1 is YES/Up.
-            # Let's check outcomes list if available
-            outcomes = json.loads(m.get('outcomes', '["No", "Yes"]'))
+            prob = 0.0
+            amount = 0.0
 
-            if winner is None:
-                # Loop to find which index has 1
-                for idx, p_str in enumerate(outcome_prices):
-                    if float(p_str) > 0.9:
-                        # Map index to "YES"/"NO"
-                        # Standard Polymarket Binary: 0=No, 1=Yes.
-                        # But sometimes it's "Down"/"Up".
-                        label = outcomes[idx].upper()
-                        if label in ["YES", "UP"]: winner = "YES"
-                        elif label in ["NO", "DOWN"]: winner = "NO"
-                        break
+            if len(row) >= 10:
+                try:
+                    prob = float(row[8])
+                    amount = float(row[9])
+                except: pass
 
-            if not winner:
-                continue # Void or unresolved
+            if prob == 0: prob = 0.99
 
-            # Check our trades on this market
-            for t in market_trades[mid]:
-                side = t['side'] # YES or NO
-                condition_raw = t['condition']
+            # Filter high probability trades
+            if prob > MAX_PROB_FILTER:
+                continue
 
-                # Classify Condition
-                cond_key = "Other"
-                if "Condition_1" in condition_raw: cond_key = "Condition_1"
-                elif "Condition_2" in condition_raw: cond_key = "Condition_2"
-                elif "Condition_3" in condition_raw: cond_key = "Condition_3"
-                elif "Condition_4" in condition_raw: cond_key = "Condition_4"
-                elif "Condition_5" in condition_raw: cond_key = "Condition_5"
+            reason = row[6] if len(row) >= 7 else "Unknown"
+            condition_name = reason.split('(')[0].strip().strip('"').strip("'")
 
-                cost = float(t.get('amount', 2.0)) # Default 2.0
+            rows.append({
+                "Time": dt,
+                "MarketID": mid,
+                "Side": side,
+                "Condition": condition_name,
+                "Prob": prob,
+                "Amount": amount
+            })
 
-                # Calculate PnL
-                # If Win: Return ~2.0 USDC (minus fees/slippage? No, pay out is 1.0 per share)
-                # Wait, Cost is USDC spent.
-                # If we bought X shares. Return is X * 1.0 (if win) or 0 (if loss).
-                # We need to know 'size' (Shares) to calc exact profit.
-                # CSV has 'amount' which is usually Cost (Target Spend).
-                # Earlier logic: Size = Amount / 0.99.
-                # So Shares ~= Amount.
-                # Profit = (Shares * 1.0) - Cost.
-                # If Shares ~= Cost, Profit is close to 0??
-                # No!
-                # Cost = Shares * PricePaid.
-                # If Price was 0.50. Cost = 2.0. Shares = 4.0.
-                # Win: Get 4.0. Profit = 4.0 - 2.0 = +2.0.
-                # Loss: Get 0. Profit = -2.0.
+    if not rows:
+        print(f"No records found for {TARGET_DATE}")
+        return None
 
-                # BUT, our bot buys at MARKET (High Limit).
-                # poly_price in CSV is the 'prob' (Best Ask) at trigger time.
-                # approximate_price = float(t['poly_price'])
-                # estimated_shares = cost / approximate_price
+    print(f"Found {len(rows)} records.")
 
-                approx_price = float(t.get('poly_price', 0.5))
-                if approx_price == 0: approx_price = 0.5
+    # Fetch Outcomes
+    market_cache = {}
+    results = []
 
-                est_shares = cost / approx_price
+    print("Fetching outcomes...")
+    for i, row in enumerate(rows):
+        if i % 10 == 0: print(f"Processing {i}/{len(rows)}...", end='\r')
 
-                if side == winner:
-                    # WIN
-                    pnl = est_shares - cost
-                    stats[cond_key]["wins"] += 1
-                else:
-                    # LOSS
-                    pnl = -cost
+        mid = str(row['MarketID'])
+        if mid in market_cache:
+            m_data = market_cache[mid]
+        else:
+            m_data = get_market_outcome(mid)
+            market_cache[mid] = m_data
+            time.sleep(0.1)
 
-                stats[cond_key]["total"] += 1
-                stats[cond_key]["pnl"] += pnl
+        outcome = "Unknown"
+        status = "Pending"
 
-            processed_count += 1
-            if processed_count % 10 == 0:
-                print(f"Processed {processed_count} markets...")
+        if m_data:
+            if m_data.get('closed'):
+                try:
+                    raw_p = m_data.get('outcomePrices', '[]')
+                    raw_o = m_data.get('outcomes', '[]')
+                    prices = json.loads(raw_p) if isinstance(raw_p, str) else raw_p
+                    outcomes = json.loads(raw_o) if isinstance(raw_o, str) else raw_o
 
-            # Rate limit
-            time.sleep(0.2)
+                    winner_idx = -1
+                    for idx, p in enumerate(prices):
+                        if float(p) > 0.9:
+                            winner_idx = idx
+                            break
 
-        except Exception as e:
-            logger.error(f"Error processing {mid}: {e}")
+                    if winner_idx != -1:
+                        outcome = outcomes[winner_idx].upper()
+                        status = "Resolved"
+                        if outcome in ['YES', 'TRUE', '1', 'UP']: outcome = 'YES'
+                        elif outcome in ['NO', 'FALSE', '0', 'DOWN']: outcome = 'NO'
+                except: pass
+            elif m_data.get('active'):
+                status = "Active"
 
-    # Report
-    print("\n" + "="*60)
-    print(f"{'Strategy':<15} | {'Win Rate':<10} | {'Trades':<6} | {'Est. PnL (USDC)':<15}")
-    print("-" * 60)
+        is_win = False
+        pnl = 0.0
 
-    total_pnl = 0
-    total_trades = 0
+        if status == "Resolved":
+            is_win = (row['Side'] == outcome)
+            if is_win:
+                # PnL = Revenue - Cost
+                # Revenue = Amount / Prob (Shares) * 1.0 (Payout is 1.0)
+                # Ensure Prob is safe
+                safe_prob = row['Prob'] if row['Prob'] > 0 else 0.99
+                revenue = row['Amount'] / safe_prob
+                pnl = revenue - row['Amount']
+            else:
+                pnl = -row['Amount']
 
-    for k, s in sorted(stats.items()):
-        if s['total'] == 0: continue
-        win_rate = (s['wins'] / s['total']) * 100
-        print(f"{k:<15} | {win_rate:6.2f}%    | {s['total']:<6} | {s['pnl']:+.2f}")
-        total_pnl += s['pnl']
-        total_trades += s['total']
+        results.append({
+            **row,
+            "Status": status,
+            "Outcome": outcome,
+            "Result": "WIN" if is_win else "LOSS",
+            "PnL": pnl
+        })
 
-    print("-" * 60)
-    print(f"{'TOTAL':<15} | {(total_pnl/total_trades if total_trades else 0):6.2f} (Avg)| {total_trades:<6} | {total_pnl:+.2f}")
-    print("="*60)
+    print(f"Processing {len(rows)}/{len(rows)}... Done.")
+
+    return results
+
+def print_stats(filename, results):
+    if not results: return
+
+    resolved = [r for r in results if r['Status'] == 'Resolved']
+
+    print("\n" + "="*80)
+    print(f" ANALYSIS: {filename} ({TARGET_DATE})")
+    print("="*80)
+
+    if not resolved:
+        print("No resolved trades yet.")
+        return
+
+    total_trades = len(resolved)
+    total_wins = sum(1 for r in resolved if r['Result'] == 'WIN')
+    total_pnl = sum(r['PnL'] for r in resolved)
+    total_invested = sum(r['Amount'] for r in resolved)
+
+    win_rate = (total_wins / total_trades) * 100
+    roi = (total_pnl / total_invested * 100) if total_invested > 0 else 0
+
+    print(f"Total Trades: {total_trades}")
+    print(f"Win Rate:     {win_rate:.2f}% ({total_wins}/{total_trades})")
+    print(f"Total PnL:    ${total_pnl:+.2f}")
+    print(f"Total Vol:    ${total_invested:.2f}")
+    print(f"ROI:          {roi:+.2f}%")
+
+    print("-" * 80)
+    print(f"{'Strategy':<30} | {'Win Rate':<8} | {'PnL':<8} | {'ROI':<7} | {'W/L':<5} | {'Pend'}")
+    print("-" * 80)
+
+    # Group by Strategy
+    strategies = {}
+    for r in results:
+        cond = r['Condition']
+        if cond not in strategies:
+            strategies[cond] = {'total': 0, 'resolved': 0, 'wins': 0, 'pnl': 0.0, 'invested': 0.0}
+
+        strategies[cond]['total'] += 1
+        if r['Status'] == 'Resolved':
+            strategies[cond]['resolved'] += 1
+            strategies[cond]['pnl'] += r['PnL']
+            strategies[cond]['invested'] += r['Amount']
+            if r['Result'] == 'WIN':
+                strategies[cond]['wins'] += 1
+
+    for strat in sorted(strategies.keys()):
+        s = strategies[strat]
+        pending = s['total'] - s['resolved']
+
+        if s['resolved'] == 0:
+            print(f"{strat:<30} | {'N/A':<8} | {'$0.00':<8} | {'0.0%':<7} | {'0/0':<5} | {pending}")
+        else:
+            rate = (s['wins'] / s['resolved']) * 100
+            roi_s = (s['pnl'] / s['invested'] * 100) if s['invested'] > 0 else 0
+            wl = f"{s['wins']}/{s['resolved']-s['wins']}"
+            print(f"{strat:<30} | {rate:5.1f}%   | ${s['pnl']:<7.2f} | {roi_s:>+6.1f}% | {wl:<5} | {pending}")
+
+    print("="*80)
+
+def main():
+    for f in FILES:
+        res = analyze_file(f)
+        print_stats(f, res)
 
 if __name__ == "__main__":
-    analyze_pnl()
+    main()
