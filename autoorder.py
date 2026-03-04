@@ -34,6 +34,8 @@ CONFIG = {
     "SIMULATION_MODE": False,
     "PRICE_OFFSET": float(os.getenv("POLY_PRICE_OFFSET", 0.0)),
     "SETTLE_INTERVAL": int(os.getenv("POLY_SETTLE_INTERVAL", 600)),
+    "MAX_PROB_5M": float(os.getenv("POLY_MAX_PROB_5M", 0.80)),
+    "MAX_PROB_15M": float(os.getenv("POLY_MAX_PROB_15M", 0.95)),
 }
 
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
@@ -446,6 +448,14 @@ class BotRunner(threading.Thread):
         # ------------------------------------------------------------------
         try:
             logger.info(f"[{self.name}] Prob: {prob:.4f}")
+
+            # 设置最大概率阈值
+            max_prob = CONFIG["MAX_PROB_5M"] if self.market_type == "5m" else CONFIG["MAX_PROB_15M"]
+
+            if prob >= max_prob:
+                logger.warning(f"概率过高 ({prob:.2f} >= {max_prob}), 放弃。")
+                self.state.has_traded = True
+                return
 
             if prob >= strategy_executor.STRATEGY_CONFIG["MAX_PROB"]:
                 logger.warning(f"概率过高 ({prob:.2f}), 放弃。")
