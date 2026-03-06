@@ -1,0 +1,2 @@
+Time,MarketID,Side,BTC_Price,Net,Fluc,Reason,Multiplier,Prob,Amount
+2026-03-07 01:16:26,1508627,NO,68263.88,-136.0,142.83000000000175,Condition_2_15M_BREAK_DOWN (Cur:68263.88 < Min:68333.14 - 68.26),1.0,0.6900,2.00
