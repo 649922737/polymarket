@@ -34,8 +34,8 @@ CONFIG = {
     "SIMULATION_MODE": False,
     "PRICE_OFFSET": float(os.getenv("POLY_PRICE_OFFSET", 0.0)),
     "SETTLE_INTERVAL": int(os.getenv("POLY_SETTLE_INTERVAL", 600)),
-    "MAX_PROB_5M": float(os.getenv("POLY_MAX_PROB_5M", 0.80)),
-    "MAX_PROB_15M": float(os.getenv("POLY_MAX_PROB_15M", 0.95)),
+    "MAX_PROB_5M": float(os.getenv("POLY_MAX_PROB_5M", 0.90)),
+    "MAX_PROB_15M": float(os.getenv("POLY_MAX_PROB_15M", 0.90)),
 }
 
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
@@ -436,6 +436,12 @@ class BotRunner(threading.Thread):
         if CONFIG["SIMULATION_MODE"]:
             self.state.has_traded = True
             logger.info(f"模拟模式：跳过实际下单 (Prob={prob:.4f}, Amount={target_amount:.2f})。")
+            return
+
+        # 15m 策略强制只记录不实际下单
+        if self.market_type == "15m":
+            self.state.has_traded = True
+            logger.info(f"[{self.name}] 15m策略处于仅模拟模式，跳过实际下单 (Prob={prob:.4f}, Amount={target_amount:.2f})。")
             return
 
         if not token_id:
