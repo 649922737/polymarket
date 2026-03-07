@@ -1,0 +1,2 @@
+Time,MarketID,Side,BTC_Price,Net,Fluc,Reason,Multiplier,Prob,Amount
+2026-03-08 00:17:01,1515615,NO,67806.67,-76.27000000000407,76.27999999999884,Condition_1_STRONG_FLUC (76.27 > 0.8*Max(86.78) & > 45.0),1.0,0.9000,3.00
